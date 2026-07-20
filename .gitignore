@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.env
+.DS_Store
+.ipynb_checkpoints/
+
+# Output files
+*.png
+*.jpg
+*.jpeg
+*.svg
+
+# IDE settings
+.vscode/
