@@ -10,6 +10,18 @@ import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+REPORT_PATH = BASE_DIR / "report" / "고객서비스_만족도개선_리포트.md"
+
+# 상담원 관점 섹션용 스냅샷. BigQuery `project1_day1.agents` 에서 미리 내려받아 둔 파일이며,
+# 없으면 팀 필터와 교육이수 비교는 자동으로 비활성화된다(DEPLOY.md 3번 항목 참고).
+AGENTS_SNAPSHOT = DATA_DIR / "agents_snapshot.csv"
+AGENT_CONSULT_SNAPSHOT = DATA_DIR / "agent_consultations_snapshot.csv"
+SNAPSHOT_DATE = "2026-07-25"
+
+# 응답 수가 적은 상담원은 NPS·CSAT 평균이 크게 흔들리므로 제외
+MIN_AGENT_RESPONSES = 10
+
+ALL_TEAMS = "전체"
 
 
 def read_csv_rows(path):
@@ -263,10 +275,459 @@ def build_tenure_scatter(customers, usage_rows):
     return fig
 
 
-def main():
-    st.set_page_config(page_title="고객은 왜 이탈하는가", layout="wide")
-    st.title("고객은 왜 이탈하는가 — 이탈 원인 진단 대시보드")
+def calculate_nps(scores):
+    """NPS = 추천고객(9~10) 비율 - 비추천고객(0~6) 비율, 단위는 포인트."""
+    if not scores:
+        return 0.0
+    promoters = sum(1 for s in scores if s >= 9)
+    detractors = sum(1 for s in scores if s <= 6)
+    return round((promoters - detractors) / len(scores) * 100, 1)
 
+
+def load_agent_snapshot():
+    """상담원 속성(팀·직원만족도·초과근무·교육이수) 스냅샷을 읽는다.
+
+    로컬 CSV 5개에는 agent_id 만 있고 상담원 마스터 테이블이 없다.
+    팀·직원만족도·교육이수는 BigQuery `project1_day1.agents` 에만 있으므로
+    스냅샷 파일이 있을 때만 채워지고, 없으면 빈 dict 를 돌려준다.
+    """
+    attrs = {}
+    if AGENTS_SNAPSHOT.exists():
+        for row in read_csv_rows(AGENTS_SNAPSHOT):
+            agent_id = (row.get("agent_id") or "").strip()
+            if not agent_id:
+                continue
+            attrs[agent_id] = {
+                "team": (row.get("team") or "").strip() or None,
+                "agent_satisfaction": to_float(row.get("agent_satisfaction")),
+                "overtime_hours_avg": to_float(row.get("overtime_hours_avg")),
+                "training_completed_yn": (row.get("training_completed_yn") or "").strip() or None,
+            }
+
+    # 교육이수 여부는 가이드 SQL 상 상담 스냅샷 쪽에 들어있어, 위에서 못 채웠으면 여기서 보완한다.
+    if AGENT_CONSULT_SNAPSHOT.exists():
+        for row in read_csv_rows(AGENT_CONSULT_SNAPSHOT):
+            agent_id = (row.get("agent_id") or "").strip()
+            if not agent_id:
+                continue
+            item = attrs.setdefault(agent_id, {
+                "team": None,
+                "agent_satisfaction": None,
+                "overtime_hours_avg": None,
+                "training_completed_yn": None,
+            })
+            if not item.get("team"):
+                item["team"] = (row.get("team") or "").strip() or None
+            if not item.get("training_completed_yn"):
+                item["training_completed_yn"] = (row.get("training_completed_yn") or "").strip() or None
+
+    return attrs
+
+
+def to_float(value):
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def build_agent_metrics(consultations, satisfactions, agent_attrs):
+    """상담원별 NPS·CSAT·업무부하·재문의율을 로컬 CSV 에서 재계산한다."""
+    agent_by_consult = {row["consult_id"]: (row.get("agent_id") or "").strip() for row in consultations}
+
+    workload = {}
+    for row in consultations:
+        agent_id = (row.get("agent_id") or "").strip()
+        if not agent_id:
+            continue
+        stats = workload.setdefault(agent_id, {"consult_count": 0, "total_min": 0, "recontact": 0})
+        stats["consult_count"] += 1
+        try:
+            stats["total_min"] += int(row.get("duration_min") or 0)
+        except (TypeError, ValueError):
+            pass
+        if row.get("is_recontact") == "Y":
+            stats["recontact"] += 1
+
+    nps_scores = defaultdict(list)
+    csat_scores = defaultdict(list)
+    for row in satisfactions:
+        agent_id = agent_by_consult.get(row.get("consult_id", ""))
+        if not agent_id:
+            continue
+        nps_raw = (row.get("nps") or "").strip()
+        if nps_raw:
+            try:
+                nps_scores[agent_id].append(int(nps_raw))
+            except ValueError:
+                pass
+        csat_raw = (row.get("csat") or "").strip()
+        if csat_raw:
+            try:
+                csat_scores[agent_id].append(int(csat_raw))
+            except ValueError:
+                pass
+
+    agents = []
+    excluded = []
+    for agent_id in sorted(set(workload) | set(nps_scores) | set(csat_scores)):
+        stats = workload.get(agent_id, {"consult_count": 0, "total_min": 0, "recontact": 0})
+        attrs = agent_attrs.get(agent_id, {})
+        nps_list = nps_scores.get(agent_id, [])
+        csat_list = csat_scores.get(agent_id, [])
+        item = {
+            "agent_id": agent_id,
+            "team": attrs.get("team"),
+            "agent_satisfaction": attrs.get("agent_satisfaction"),
+            "overtime_hours_avg": attrs.get("overtime_hours_avg"),
+            "training_completed_yn": attrs.get("training_completed_yn"),
+            "nps": calculate_nps(nps_list),
+            "nps_scores": nps_list,
+            "csat_scores": csat_list,
+            "csat_avg": round(sum(csat_list) / len(csat_list), 2) if csat_list else None,
+            "workload_hours": round(stats["total_min"] / 60, 1),
+            "consult_count": stats["consult_count"],
+            "recontact_rate": round(stats["recontact"] / stats["consult_count"] * 100, 1) if stats["consult_count"] else 0.0,
+            "response_count": len(nps_list),
+            "csat_response_count": len(csat_list),
+        }
+        # NPS·CSAT 둘 중 하나라도 표본이 충분하면 표시 대상으로 둔다.
+        if max(len(nps_list), len(csat_list)) >= MIN_AGENT_RESPONSES:
+            agents.append(item)
+        else:
+            excluded.append(item)
+
+    return agents, excluded
+
+
+def available_teams(agents):
+    return sorted({a["team"] for a in agents if a.get("team")})
+
+
+def filter_by_team(agents, team):
+    if team == ALL_TEAMS:
+        return agents
+    return [a for a in agents if a.get("team") == team]
+
+
+def build_nps_gauge(agents, label):
+    """선택 범위의 고객 NPS 게이지. 상담원별 원점수를 모두 합쳐서 계산한다."""
+    pooled = [s for a in agents for s in a["nps_scores"]]
+    nps = calculate_nps(pooled)
+
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=nps,
+        number={"suffix": "점", "font": {"size": 40}},
+        title={
+            "text": f"{label} 고객 NPS<br><span style='font-size:12px;color:#666'>"
+                    f"응답 {len(pooled):,}건 · 상담원 {len(agents)}명</span>",
+            "font": {"size": 16},
+        },
+        gauge={
+            "axis": {"range": [-100, 100], "tickmode": "array", "tickvals": [-100, -50, 0, 50, 100], "tickfont": {"size": 11}},
+            "bar": {"color": "#2F4F4F", "thickness": 0.28},
+            "borderwidth": 1,
+            "bordercolor": "#D9D9D9",
+            "steps": [
+                {"range": [-100, -50], "color": "#E45756"},
+                {"range": [-50, 0], "color": "#F5B0AF"},
+                {"range": [0, 50], "color": "#EDF3F8"},
+                {"range": [50, 100], "color": "#BBD3E8"},
+            ],
+            "threshold": {"line": {"color": "#333333", "width": 3}, "thickness": 0.85, "value": 0},
+        },
+    ))
+    fig.update_layout(
+        template="plotly_white",
+        font=dict(family="Malgun Gothic, Arial, sans-serif"),
+        height=250,
+        margin=dict(t=70, b=10, l=20, r=20),
+    )
+    return fig, nps
+
+
+def build_agent_card(label, agent, reference):
+    """최고/중앙값/최저 상담원 카드. 선택 범위 NPS 대비 델타를 함께 보여준다."""
+    fig = go.Figure(go.Indicator(
+        mode="number+delta",
+        value=agent["nps"],
+        number={"suffix": "점", "font": {"size": 34}},
+        delta={
+            "reference": reference,
+            "valueformat": ".1f",
+            "increasing": {"color": "#4C78A8"},
+            "decreasing": {"color": "#E45756"},
+            "font": {"size": 14},
+        },
+        title={
+            "text": f"{label}<br><span style='font-size:12px;color:#666'>"
+                    f"{agent['agent_id']} · {agent['response_count']}건</span>",
+            "font": {"size": 15},
+        },
+    ))
+    fig.update_layout(
+        template="plotly_white",
+        font=dict(family="Malgun Gothic, Arial, sans-serif"),
+        height=250,
+        margin=dict(t=70, b=10, l=20, r=20),
+    )
+    return fig
+
+
+def pearson_r(xs, ys):
+    n = len(xs)
+    if n < 2:
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    if var_x == 0 or var_y == 0:
+        return None
+    return cov / (var_x * var_y) ** 0.5
+
+
+def least_squares_line(xs, ys):
+    """추세선용 최소제곱 직선. 표본이 2개 미만이거나 x가 한 점이면 None."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    if var_x == 0:
+        return None
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / var_x
+    intercept = mean_y - slope * mean_x
+    x_min, x_max = min(xs), max(xs)
+    return [x_min, x_max], [intercept + slope * x_min, intercept + slope * x_max]
+
+
+def build_burnout_scatter(agents, label):
+    """번아웃 대리지표와 CSAT 평균의 관계.
+
+    실제 초과근무(overtime_hours_avg)가 스냅샷에 있으면 그 값을, 없으면
+    총 상담시간을 번아웃 대리지표로 x축에 쓴다.
+    """
+    points = [a for a in agents if a["csat_avg"] is not None]
+    has_overtime = bool(points) and all(a.get("overtime_hours_avg") is not None for a in points)
+
+    if has_overtime:
+        x_col, x_label = "overtime_hours_avg", "평균 초과근무 시간 (시간)"
+        subtitle = "실제 초과근무 데이터 기준"
+    else:
+        x_col, x_label = "workload_hours", "업무부하 · 총 상담시간 (시간)"
+        subtitle = "※ 초과근무 데이터가 없어 '총 상담시간'을 번아웃 대리지표로 사용"
+
+    xs = [a[x_col] for a in points]
+    ys = [a["csat_avg"] for a in points]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=xs,
+        y=ys,
+        mode="markers",
+        name="상담원",
+        marker=dict(size=13, color="#4C78A8", line=dict(width=1, color="white")),
+        customdata=[[a["agent_id"], a["team"] or "-", a["consult_count"], a["csat_response_count"]] for a in points],
+        hovertemplate="<b>%{customdata[0]}</b> (%{customdata[1]})<br>"
+                      + x_label + ": %{x:.1f}<br>CSAT 평균: %{y:.2f}<br>"
+                      "상담 건수: %{customdata[2]}건<br>CSAT 응답: %{customdata[3]}건<extra></extra>",
+    ))
+
+    line = least_squares_line(xs, ys)
+    if line:
+        fig.add_trace(go.Scatter(x=line[0], y=line[1], mode="lines", name="추세선",
+                                 line=dict(color="#E45756", width=2), hoverinfo="skip"))
+
+    r = pearson_r(xs, ys)
+    r_text = f"<b>r = {r:.2f}</b>" if r is not None else "<b>r 계산 불가</b><br><span style='font-size:11px'>표본 부족</span>"
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0.99, y=0.98, xanchor="right", yanchor="top",
+        text=r_text, showarrow=False, font=dict(size=16, color="#E45756"),
+        bgcolor="rgba(255,255,255,0.85)", bordercolor="#E45756", borderwidth=1, borderpad=6,
+    )
+
+    fig.update_layout(
+        template="plotly_white",
+        font=dict(family="Malgun Gothic, Arial, sans-serif"),
+        title=f"{label} · 번아웃과 CSAT 평균<br><span style='font-size:11px;color:#888'>{subtitle}</span>",
+        xaxis_title=x_label,
+        yaxis_title="CSAT 평균 (1~5점)",
+        height=420,
+        margin=dict(t=90),
+        showlegend=False,
+    )
+    return fig, len(points)
+
+
+def build_training_chart(agents, label):
+    """교육이수 여부별 CSAT 평균·재문의율 비교. 표본 수를 함께 노출한다."""
+    groups = {"이수": [], "미이수": []}
+    for agent in agents:
+        flag = agent.get("training_completed_yn")
+        if flag == "Y":
+            groups["이수"].append(agent)
+        elif flag == "N":
+            groups["미이수"].append(agent)
+
+    rows = []
+    for name, members in groups.items():
+        pooled_csat = [s for a in members for s in a["csat_scores"]]
+        total_consults = sum(a["consult_count"] for a in members)
+        total_recontact = sum(a["consult_count"] * a["recontact_rate"] / 100 for a in members)
+        rows.append({
+            "구분": name,
+            "상담원수": len(members),
+            "csat_avg": round(sum(pooled_csat) / len(pooled_csat), 2) if pooled_csat else 0.0,
+            "응답수": len(pooled_csat),
+            "재문의율": round(total_recontact / total_consults * 100, 1) if total_consults else 0.0,
+        })
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=[r["구분"] for r in rows],
+        y=[r["csat_avg"] for r in rows],
+        marker_color=["#4C78A8", "#E45756"],
+        text=[f"{r['csat_avg']:.2f}" for r in rows],
+        textposition="outside",
+        customdata=[[r["상담원수"], r["응답수"], r["재문의율"]] for r in rows],
+        hovertemplate="<b>%{x}</b><br>CSAT 평균: %{y:.2f}<br>"
+                      "상담원 %{customdata[0]}명 · 응답 %{customdata[1]}건<br>"
+                      "재문의율: %{customdata[2]:.1f}%<extra></extra>",
+    ))
+    max_csat = max([r["csat_avg"] for r in rows] or [0])
+    fig.update_layout(
+        template="plotly_white",
+        font=dict(family="Malgun Gothic, Arial, sans-serif"),
+        title=f"{label} · 교육이수 여부별 CSAT 평균",
+        xaxis_title="교육이수 여부",
+        yaxis_title="CSAT 평균 (1~5점)",
+        yaxis_range=[0, max_csat * 1.25 + 0.5],
+        height=420,
+        margin=dict(t=90),
+    )
+    return fig, rows
+
+
+def render_agent_section(consultations, satisfactions):
+    """⑦ 상담원 관점 섹션. 팀 필터 하나로 07~09번 컴포넌트를 함께 제어한다."""
+    st.subheader("⑦ 상담원 관점: 직원만족도와 고객 경험")
+
+    agent_attrs = load_agent_snapshot()
+    agents, excluded = build_agent_metrics(consultations, satisfactions, agent_attrs)
+    teams = available_teams(agents)
+
+    if teams:
+        st.caption(f"🟡 스냅샷 데이터 · `data/agents_snapshot.csv` 기준 (SNAPSHOT_DATE {SNAPSHOT_DATE})")
+    else:
+        st.caption(
+            "⚪ 팀·직원만족도·교육이수 데이터 없음 — 로컬 CSV 5개에는 `agent_id` 만 있습니다. "
+            "`data/agents_snapshot.csv` 를 넣으면 팀 필터와 교육이수 비교가 자동으로 켜집니다 (DEPLOY.md 3번 참고)."
+        )
+
+    selected_team = st.radio(
+        "팀 선택",
+        [ALL_TEAMS] + teams,
+        horizontal=True,
+        key="agent_team_filter",
+        disabled=not teams,
+        help="팀 데이터가 없으면 전체만 선택할 수 있습니다." if not teams else None,
+    )
+
+    scoped = filter_by_team(agents, selected_team)
+    label = "전체" if selected_team == ALL_TEAMS else selected_team
+
+    if not scoped:
+        st.info(f"{label}에 표시할 상담원이 없습니다. (CSAT·NPS 응답 {MIN_AGENT_RESPONSES}건 이상인 상담원만 집계)")
+        return
+
+    # 07번 — 스코어카드를 가로로 나란히
+    gauge_fig, scope_nps = build_nps_gauge(scoped, label)
+    ranked = sorted([a for a in scoped if a["response_count"] > 0], key=lambda x: x["nps"], reverse=True)
+
+    cols = st.columns(4)
+    cols[0].plotly_chart(gauge_fig, use_container_width=True)
+    if ranked:
+        cards = [
+            ("최고 상담원", ranked[0]),
+            ("중앙값 상담원", ranked[len(ranked) // 2]),
+            ("최저 상담원", ranked[-1]),
+        ]
+        for col, (card_label, agent) in zip(cols[1:], cards):
+            col.plotly_chart(build_agent_card(card_label, agent, scope_nps), use_container_width=True)
+    else:
+        cols[1].info("NPS 응답이 있는 상담원이 없습니다.")
+
+    st.caption(
+        f"※ 직원 대상 eNPS가 아니라, 상담을 경험한 **고객**이 응답한 NPS입니다 — "
+        f"`data_satisfaction.csv` 의 nps를 `agent_id` 로 집계한 값입니다. "
+        f"표시 대상 상담원 {len(scoped)}명"
+        + (f" · 응답 {MIN_AGENT_RESPONSES}건 미만으로 제외 {len(excluded)}명" if excluded else "")
+    )
+
+    # 08번·09번 — 아래에 나란히
+    lower = st.columns(2)
+    with lower[0]:
+        scatter_fig, point_count = build_burnout_scatter(scoped, label)
+        st.plotly_chart(scatter_fig, use_container_width=True)
+        if point_count < 3:
+            st.caption(f"표본 {point_count}명 — 추세선과 상관계수는 참고용으로만 보세요.")
+
+    with lower[1]:
+        if any(a.get("training_completed_yn") in ("Y", "N") for a in scoped):
+            training_fig, rows = build_training_chart(scoped, label)
+            st.plotly_chart(training_fig, use_container_width=True)
+            counts = " · ".join(f"{r['구분']} {r['상담원수']}명" for r in rows)
+            st.caption(f"{counts} — 교육이수 여부는 입사 시점과 얽혀 있어 개인 역량 지표로 읽지 마세요.")
+        else:
+            st.info(
+                "교육이수 비교를 그릴 데이터가 없습니다.\n\n"
+                "`training_completed_yn` 은 BigQuery `project1_day1.agents` 에만 있어, "
+                "스냅샷 CSV를 넣어야 표시됩니다."
+            )
+
+    if len(scoped) <= 7:
+        st.warning(
+            f"⚠️ {label} 표본은 상담원 {len(scoped)}명입니다. 리포트 §4.5 기준으로 "
+            "한 사람의 응답이 팀 NPS를 28.6~33.3%p 움직이므로, 팀 간 순위 비교의 근거로 쓰기에는 부족합니다."
+        )
+
+
+def split_frontmatter(text):
+    """마크다운 앞머리 YAML 블록을 본문과 분리한다.
+
+    st.markdown 은 YAML 을 모르기 때문에, 그냥 넘기면 `---` 가 구분선으로,
+    그 아래 title/date 줄이 큰 제목으로 잘못 렌더된다.
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            meta = {}
+            for line in lines[1:index]:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    meta[key.strip()] = value.strip().strip('"')
+            return meta, "\n".join(lines[index + 1:]).lstrip("\n")
+
+    return {}, text
+
+
+@st.cache_data(show_spinner=False)
+def load_report():
+    """개선 제안 리포트 마크다운을 읽어 (메타데이터, 본문) 으로 돌려준다."""
+    if not REPORT_PATH.exists():
+        return None, None
+    return split_frontmatter(REPORT_PATH.read_text(encoding="utf-8"))
+
+
+def render_dashboard_tab():
+    """대시보드 탭 — 지표 카드와 ①~⑥ 차트, ⑦ 상담원 관점 섹션."""
     customers, vocs, consultations, satisfactions, usage_rows = load_data()
     total_customers, churned_customers, overall_rate = build_overall_metrics(customers)
 
@@ -293,6 +754,43 @@ def main():
 
     st.subheader("⑥ 가입기간·이용량으로 본 이탈")
     st.plotly_chart(build_tenure_scatter(customers, usage_rows), use_container_width=True)
+
+    st.divider()
+    render_agent_section(consultations, satisfactions)
+
+
+def render_report_tab():
+    """개선 제안 리포트 탭 — 마크다운 전문을 그대로 렌더한다."""
+    meta, body = load_report()
+
+    if body is None:
+        st.error(
+            f"리포트 파일을 찾을 수 없습니다: `{REPORT_PATH.relative_to(BASE_DIR)}`\n\n"
+            "`report/` 폴더가 저장소에 함께 올라갔는지 확인해 주세요."
+        )
+        return
+
+    caption_parts = []
+    if meta.get("date"):
+        caption_parts.append(f"작성일 {meta['date']}")
+    caption_parts.append(f"출처 `{REPORT_PATH.relative_to(BASE_DIR).as_posix()}`")
+    st.caption(" · ".join(caption_parts))
+
+    # <sup> 각주 표기가 있어 HTML 을 허용한다. 저장소 안의 자체 작성 파일만 읽는다.
+    st.markdown(body, unsafe_allow_html=True)
+
+
+def main():
+    st.set_page_config(page_title="고객은 왜 이탈하는가", layout="wide")
+    st.title("고객은 왜 이탈하는가 — 이탈 원인 진단 대시보드")
+
+    tab_dashboard, tab_report = st.tabs(["대시보드", "개선 제안 리포트"])
+
+    with tab_dashboard:
+        render_dashboard_tab()
+
+    with tab_report:
+        render_report_tab()
 
 
 if __name__ == "__main__":

@@ -2,3 +2,4 @@ streamlit
 pandas
 plotly
 matplotlib
+statsmodels==0.14.6
