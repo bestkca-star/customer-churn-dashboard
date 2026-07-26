@@ -17,3 +17,9 @@ venv/
 
 # IDE settings
 .vscode/
+
+# 차트 산출물 HTML — plotly.js 번들이 통째로 박혀 파일당 4~5MB
+charts/output/*.html
+
+# OneDrive 부산물
+desktop.ini
