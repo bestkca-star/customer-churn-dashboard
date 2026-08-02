@@ -726,6 +726,18 @@ def load_report():
     return split_frontmatter(REPORT_PATH.read_text(encoding="utf-8"))
 
 
+def kpi_card(label, value, accent, sub=None):
+    """스타일 지표 카드 (HTML). accent는 #RRGGBB 형식."""
+    sub_html = f'<div style="color:#9aa0a6;font-size:12px;margin-top:3px;">{sub}</div>' if sub else ""
+    return (
+        f'<div style="background:{accent}12;border:1px solid {accent}33;border-left:5px solid {accent};'
+        f'border-radius:10px;padding:14px 18px;">'
+        f'<div style="color:#6b7280;font-size:13px;">{label}</div>'
+        f'<div style="font-size:30px;font-weight:800;color:{accent};margin-top:3px;line-height:1.1;">{value}</div>'
+        f'{sub_html}</div>'
+    )
+
+
 def render_dashboard_tab():
     """대시보드 탭 — 지표 카드와 ①~⑥ 차트, ⑦ 상담원 관점 섹션."""
     st.markdown("##### 🔹 소주제: 고객 이탈 분석 — VOC·채널·요금제·지역 등으로 본 이탈 (이전 분석)")
@@ -733,9 +745,10 @@ def render_dashboard_tab():
     total_customers, churned_customers, overall_rate = build_overall_metrics(customers)
 
     cols = st.columns(3)
-    cols[0].metric("전체 고객 수", f"{total_customers}명")
-    cols[1].metric("이탈 고객 수", f"{churned_customers}명")
-    cols[2].metric("전체 이탈율", f"{overall_rate:.1f}%")
+    cols[0].markdown(kpi_card("전체 고객 수", f"{total_customers:,}명", "#4C78A8"), unsafe_allow_html=True)
+    cols[1].markdown(kpi_card("이탈 고객 수", f"{churned_customers:,}명", "#F58518"), unsafe_allow_html=True)
+    cols[2].markdown(kpi_card("전체 이탈율", f"{overall_rate:.1f}%", "#E45756", sub=f"이탈 {churned_customers}명 / 전체 {total_customers}명"), unsafe_allow_html=True)
+    st.write("")
 
     st.subheader("① VOC로 본 이탈")
     st.plotly_chart(build_voc_chart(customers, vocs), use_container_width=True)
