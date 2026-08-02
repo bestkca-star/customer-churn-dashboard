@@ -778,6 +778,24 @@ def render_report_tab():
     caption_parts.append(f"출처 `{REPORT_PATH.relative_to(BASE_DIR).as_posix()}`")
     st.caption(" · ".join(caption_parts))
 
+    # 가독성: 줄간격·헤더 간격·표 글자크기 (markdown 렌더에 가볍게 적용)
+    st.markdown(
+        "<style>"
+        "div[data-testid='stMarkdownContainer'] p,"
+        "div[data-testid='stMarkdownContainer'] li { line-height: 1.8; }"
+        "div[data-testid='stMarkdownContainer'] h2 { margin-top: 1.6em; padding-bottom:.25em; border-bottom:1px solid #e6e6e6; }"
+        "div[data-testid='stMarkdownContainer'] h3 { margin-top: 1.1em; color:#2E5A88; }"
+        "div[data-testid='stMarkdownContainer'] table { font-size: 14px; }"
+        "</style>",
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "**한눈에 보기** — 2024년 상담 1,320건 전수 분석 · 재문의율 **21.4%**(개선기준 20% 초과) · "
+        "재문의가 갈리는 축은 **상담 채널** 하나(비동기 채널이 전화의 2배 이상) · "
+        "상담원·카테고리는 유의하지 않음 · 직원만족도·번아웃은 고객경험과 유의하게 연결."
+    )
+    st.divider()
+
     # <sup> 각주 표기가 있어 HTML 을 허용한다. 저장소 안의 자체 작성 파일만 읽는다.
     st.markdown(body, unsafe_allow_html=True)
 
@@ -908,6 +926,78 @@ def build_spend_trend_chart(spend, campaigns):
     return fig
 
 
+def _channel_stats(spend):
+    """채널별 지출합·유입합·유입1건당비용(CAC)."""
+    agg = {}
+    for row in spend:
+        s = agg.setdefault(row["channel"], {"spend": 0, "signups": 0})
+        s["spend"] += _to_int(row["spend"])
+        s["signups"] += _to_int(row["signups"])
+    for s in agg.values():
+        s["cac"] = s["spend"] / s["signups"] if s["signups"] else 0
+    return agg
+
+
+def build_reallocation_chart(spend):
+    """[가상 H1] SNS광고 예산의 30%를 고효율 2채널로 재배분 시 총 유입(선형 가정)."""
+    stats = _channel_stats(spend)
+    move_from, targets, ratio = "SNS광고", ["지인추천", "자사앱푸시"], 0.30
+    move_amt = stats[move_from]["spend"] * ratio
+
+    new_spend = {ch: s["spend"] for ch, s in stats.items()}
+    new_spend[move_from] -= move_amt
+    for t in targets:
+        new_spend[t] += move_amt / len(targets)
+
+    current = sum(s["signups"] for s in stats.values())
+    projected = sum((new_spend[ch] / stats[ch]["cac"]) if stats[ch]["cac"] else 0 for ch in stats)
+
+    rows = [
+        {"시나리오": "현재", "총 유입(추정)": round(current)},
+        {"시나리오": "재배분(가상)", "총 유입(추정)": round(projected)},
+    ]
+    fig = px.bar(
+        rows, x="시나리오", y="총 유입(추정)",
+        text=[f"{r['총 유입(추정)']:,}건" for r in rows], color="시나리오",
+        color_discrete_map={"현재": COLOR_BASE, "재배분(가상)": "#59A14F"},
+        title="🧪 H1. 예산 재배분 What-if (가상 · 선형 가정)",
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(
+        yaxis_title="총 유입 (건, 추정)", xaxis_title="",
+        template="plotly_white", font=dict(family="Malgun Gothic, Arial, sans-serif"),
+        showlegend=False,
+    )
+    return fig
+
+
+def build_diminishing_chart(spend):
+    """[가상 H2] 저비용 채널 예산 확대 시 수확체감(제곱근 가정)."""
+    stats = _channel_stats(spend)
+    channels = ["지인추천", "자사앱푸시"]
+    mults = [1, 1.5, 2, 2.5, 3, 4, 5]
+    rows = []
+    for ch in channels:
+        base = stats[ch]["signups"]
+        for m in mults:
+            rows.append({"채널": ch, "예산배수": m, "유입(가상)": round(base * (m ** 0.6))})
+    # 선형(2배 예산=2배 유입) 참조선 — 지인추천 기준
+    base_ref = stats["지인추천"]["signups"]
+    for m in mults:
+        rows.append({"채널": "선형 가정(참조)", "예산배수": m, "유입(가상)": round(base_ref * m)})
+
+    fig = px.line(
+        rows, x="예산배수", y="유입(가상)", color="채널", markers=True,
+        title="🧪 H2. 저비용 채널 예산 확대 시 수확체감 (가상)",
+        color_discrete_map={"지인추천": COLOR_BASE, "자사앱푸시": "#59A14F", "선형 가정(참조)": "#BAB0AC"},
+    )
+    fig.update_layout(
+        yaxis_title="유입 (건, 가상)", xaxis_title="예산 배수 (현재=1)",
+        template="plotly_white", font=dict(family="Malgun Gothic, Arial, sans-serif"),
+    )
+    return fig
+
+
 def render_marketing_tab():
     """채널 효율 탭 — 유입 1건당 비용·집행률·지출 추세."""
     st.markdown("##### 🔹 소주제: 마케팅 채널 효율성 — 채널별 유입 1건당 비용 · 예산 집행률")
@@ -938,10 +1028,69 @@ def render_marketing_tab():
     st.info("💡 **시사점**: 비효율(고비용) 채널 예산을 고효율(저비용) 채널로 재배분할 여지가 있습니다. "
             "단 표본이 작아 추세 모니터링을 병행하세요.")
 
+    # ── 가상 시나리오 (가설 H1·H2) ──────────────────────────────
+    st.divider()
+    st.markdown("### 🧪 가상 시나리오 (가설 시뮬레이션)")
+    st.warning(
+        "⚠️ 아래 두 차트는 **실제 데이터가 아니라 '가정'에 기반한 가상 시뮬레이션**입니다. "
+        "의사결정 사고(what-if)를 보여주기 위한 예시이며, 실제 집행 결과가 아닙니다."
+    )
+
+    st.plotly_chart(build_reallocation_chart(spend), use_container_width=True)
+    st.caption(
+        "**H1 · 예산 재배분**: SNS광고 예산의 30%를 고효율 채널(지인추천·자사앱푸시)로 옮기고 "
+        "각 채널의 유입 1건당 비용이 그대로라고 **선형 가정**하면 같은 예산으로 총 유입이 크게 늘어납니다. "
+        "다만 이는 이상적 상한선 — 현실은 아래 H2처럼 수확체감이 작용합니다."
+    )
+
+    st.plotly_chart(build_diminishing_chart(spend), use_container_width=True)
+    st.caption(
+        "**H2 · 수확체감**: 저비용 채널이라도 예산을 2배로 늘린다고 유입이 2배가 되진 않습니다"
+        "(제곱근 모델 가정). 회색 '선형 가정' 선과 벌어지는 만큼이 현실의 한계입니다. "
+        "→ H1의 재배분 효과는 **상한선으로만** 참고하고, 소규모로 시험 집행하며 확인하는 것이 안전합니다."
+    )
+
+
+def render_banner():
+    """상단 헤드라인 배너 — 그라데이션 + 핵심 KPI 칩."""
+    spend, campaigns = load_marketing()
+    chips = ""
+    if spend and campaigns:
+        stats = _channel_stats(spend)
+        scored = [c for c in stats if stats[c]["signups"]]
+        best = min(scored, key=lambda c: stats[c]["cac"])
+        worst = max(scored, key=lambda c: stats[c]["cac"])
+        comp = [r for r in campaigns if r["is_completed"] == "True"]
+        tb = sum(_to_int(r["예산"]) for r in comp)
+        ta = sum(_to_int(r["실집행"]) for r in comp)
+        rate = round(ta / tb * 100) if tb else 0
+
+        def chip(text):
+            return (f'<span style="background:rgba(255,255,255,.18);padding:7px 14px;'
+                    f'border-radius:18px;font-size:13px;white-space:nowrap;">{text}</span>')
+
+        chips = (
+            '<div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap;">'
+            + chip(f"🏆 최고효율 {best} {round(stats[best]['cac']):,}원")
+            + chip(f"💸 최저효율 {worst} {round(stats[worst]['cac']):,}원")
+            + chip(f"📊 전체 집행률 {rate}%")
+            + "</div>"
+        )
+
+    st.markdown(
+        '<div style="background:linear-gradient(90deg,#4C78A8 0%,#2E5A88 100%);'
+        'padding:22px 28px;border-radius:14px;color:#fff;margin-bottom:10px;">'
+        '<div style="font-size:26px;font-weight:800;letter-spacing:-.5px;">📈 마케팅 채널 효율성 분석</div>'
+        '<div style="opacity:.92;margin-top:5px;font-size:15px;">'
+        '채널별 유입 1건당 비용과 예산 집행률로 효율 채널을 진단합니다</div>'
+        + chips + "</div>",
+        unsafe_allow_html=True,
+    )
+
 
 def main():
     st.set_page_config(page_title="마케팅 채널 효율성 분석", layout="wide")
-    st.title("마케팅 채널 효율성 분석")
+    render_banner()
 
     tab_marketing, tab_dashboard, tab_report = st.tabs(
         ["마케팅 채널 효율", "고객 이탈 분석", "이탈 개선 리포트"]
