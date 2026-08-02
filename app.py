@@ -728,6 +728,7 @@ def load_report():
 
 def render_dashboard_tab():
     """대시보드 탭 — 지표 카드와 ①~⑥ 차트, ⑦ 상담원 관점 섹션."""
+    st.markdown("##### 🔹 소주제: 고객 이탈 분석 — VOC·채널·요금제·지역 등으로 본 이탈 (이전 분석)")
     customers, vocs, consultations, satisfactions, usage_rows = load_data()
     total_customers, churned_customers, overall_rate = build_overall_metrics(customers)
 
@@ -761,6 +762,7 @@ def render_dashboard_tab():
 
 def render_report_tab():
     """개선 제안 리포트 탭 — 마크다운 전문을 그대로 렌더한다."""
+    st.markdown("##### 🔹 소주제: 고객 이탈 개선 제안 리포트")
     meta, body = load_report()
 
     if body is None:
@@ -780,11 +782,173 @@ def render_report_tab():
     st.markdown(body, unsafe_allow_html=True)
 
 
-def main():
-    st.set_page_config(page_title="고객은 왜 이탈하는가", layout="wide")
-    st.title("고객은 왜 이탈하는가 — 이탈 원인 진단 대시보드")
+# ─────────────────────────────────────────────────────────────
+# 마케팅 채널 효율성 분석 (4주차 프로젝트: 마케팅 채널 효율성 분석)
+# 데이터: data/data_marketing_spend.csv (채널×월, 2019-01~2024-06)
+#        data/marketing_campaigns.csv (캠페인, 2024-05~07, 예산 有)
+# 결합은 파일/DB에 저장하지 않고 여기서 매번 읽어 합친다(교안 방식).
+# ─────────────────────────────────────────────────────────────
+MARKETING_SPEND = DATA_DIR / "data_marketing_spend.csv"
+MARKETING_CAMPAIGNS = DATA_DIR / "marketing_campaigns.csv"
 
-    tab_dashboard, tab_report = st.tabs(["대시보드", "개선 제안 리포트"])
+COLOR_BASE = "#4C78A8"   # 기본 파랑
+COLOR_WARN = "#E45756"   # 강조 빨강
+
+
+def _to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def load_marketing():
+    spend = read_csv_rows(MARKETING_SPEND) if MARKETING_SPEND.exists() else []
+    campaigns = read_csv_rows(MARKETING_CAMPAIGNS) if MARKETING_CAMPAIGNS.exists() else []
+    return spend, campaigns
+
+
+def verify_overlap(spend, campaigns):
+    """2024-05·06월: spend(월지출) vs campaigns(실집행 합)이 일치하는지 대조."""
+    camp_sum = defaultdict(int)
+    for row in campaigns:
+        if row["월"] in ("2024-05", "2024-06"):
+            camp_sum[(row["월"], row["채널"])] += _to_int(row["실집행"])
+    ok = total = 0
+    for row in spend:
+        if row["month"] in ("2024-05", "2024-06"):
+            total += 1
+            if _to_int(row["spend"]) == camp_sum.get((row["month"], row["channel"])):
+                ok += 1
+    return ok, total
+
+
+def build_cac_chart(spend):
+    """채널별 유입 1건당 비용(=지출합/유입합). 낮을수록 효율적."""
+    agg = {}
+    for row in spend:
+        stats = agg.setdefault(row["channel"], {"spend": 0, "signups": 0})
+        stats["spend"] += _to_int(row["spend"])
+        stats["signups"] += _to_int(row["signups"])
+    rows = []
+    for channel, stats in agg.items():
+        cac = round(stats["spend"] / stats["signups"]) if stats["signups"] else 0
+        rows.append({"채널": channel, "유입1건당비용": cac, "지출합": stats["spend"], "유입합": stats["signups"]})
+    rows.sort(key=lambda r: r["유입1건당비용"])  # 싼 채널이 왼쪽
+    worst = max(rows, key=lambda r: r["유입1건당비용"])["채널"] if rows else None
+    colors = [COLOR_WARN if r["채널"] == worst else COLOR_BASE for r in rows]
+
+    fig = px.bar(
+        rows, x="채널", y="유입1건당비용",
+        text=[f"{r['유입1건당비용']:,}원" for r in rows],
+        title="① 채널별 유입 1건당 비용 (2019-01~2024-06)",
+        hover_data={"지출합": ":,", "유입합": True, "유입1건당비용": ":,"},
+    )
+    fig.update_traces(marker_color=colors, textposition="outside")
+    fig.update_layout(
+        yaxis_title="유입 1건당 비용 (원)", xaxis_title="채널",
+        template="plotly_white", font=dict(family="Malgun Gothic, Arial, sans-serif"),
+        showlegend=False,
+    )
+    return fig
+
+
+def build_execution_chart(campaigns):
+    """완료 캠페인 기준 채널별 예산 집행률(=실집행/예산×100). 100% 초과=예산 초과."""
+    bc = {}
+    for row in campaigns:
+        if row["is_completed"] != "True":
+            continue
+        stats = bc.setdefault(row["채널"], {"budget": 0, "actual": 0})
+        stats["budget"] += _to_int(row["예산"])
+        stats["actual"] += _to_int(row["실집행"])
+    rows = []
+    for channel, stats in bc.items():
+        rate = round(stats["actual"] / stats["budget"] * 100) if stats["budget"] else 0
+        rows.append({"채널": channel, "집행률": rate, "예산": stats["budget"], "실집행": stats["actual"]})
+    rows.sort(key=lambda r: -r["집행률"])
+    colors = [COLOR_WARN if r["집행률"] > 100 else COLOR_BASE for r in rows]
+
+    fig = px.bar(
+        rows, x="채널", y="집행률",
+        text=[f"{r['집행률']}%" for r in rows],
+        title="② 채널별 예산 집행률 (완료 캠페인, 2024)",
+        hover_data={"예산": ":,", "실집행": ":,", "집행률": True},
+    )
+    fig.update_traces(marker_color=colors, textposition="outside")
+    fig.add_hline(y=100, line_dash="dash", line_color="gray", annotation_text="예산 100%")
+    fig.update_layout(
+        yaxis_title="집행률 (%)", xaxis_title="채널",
+        template="plotly_white", font=dict(family="Malgun Gothic, Arial, sans-serif"),
+        showlegend=False,
+    )
+    return fig
+
+
+def build_spend_trend_chart(spend, campaigns):
+    """월별 총 마케팅 지출 추세. 2024-07은 campaigns 실집행으로 이어붙임."""
+    monthly = defaultdict(int)
+    for row in spend:
+        monthly[row["month"]] += _to_int(row["spend"])
+    for row in campaigns:
+        if row["월"] == "2024-07":
+            monthly["2024-07"] += _to_int(row["실집행"])
+    months = sorted(monthly)
+    rows = [{"월": m, "총지출": monthly[m]} for m in months]
+
+    fig = px.line(
+        rows, x="월", y="총지출", markers=False,
+        title="③ 월별 총 마케팅 지출 추세 (2019-01~2024-07)",
+    )
+    fig.update_traces(line_color=COLOR_BASE)
+    fig.update_layout(
+        yaxis_title="총 지출 (원)", xaxis_title="월",
+        template="plotly_white", font=dict(family="Malgun Gothic, Arial, sans-serif"),
+    )
+    return fig
+
+
+def render_marketing_tab():
+    """채널 효율 탭 — 유입 1건당 비용·집행률·지출 추세."""
+    st.markdown("##### 🔹 소주제: 마케팅 채널 효율성 — 채널별 유입 1건당 비용 · 예산 집행률")
+    spend, campaigns = load_marketing()
+    if not spend or not campaigns:
+        st.warning(
+            "마케팅 데이터 파일이 없습니다. "
+            "`data/data_marketing_spend.csv` 와 `data/marketing_campaigns.csv` 가 있는지 확인해 주세요."
+        )
+        return
+
+    ok, total = verify_overlap(spend, campaigns)
+    if total and ok == total:
+        st.caption(f"🟢 데이터 대조검증: 2024-05·06월 {ok}/{total} 채널×월 일치 (두 데이터가 맞물림)")
+    else:
+        st.caption(f"🟡 데이터 대조검증: {ok}/{total} 일치 — 확인 필요")
+
+    st.plotly_chart(build_cac_chart(spend), use_container_width=True)
+    st.caption("돈을 가장 많이 쓴 SNS광고가 유입 1건당 비용은 최고(약 15만원) — 지인추천의 약 52배. "
+               "채널별 유입 표본이 60~110건으로 크지 않아 '경향'으로 해석하세요.")
+
+    st.plotly_chart(build_execution_chart(campaigns), use_container_width=True)
+    st.caption("100% 초과(빨강)는 예산보다 더 쓴 채널. 지인추천·제휴사는 83%로 예산 여력이 있음.")
+
+    st.plotly_chart(build_spend_trend_chart(spend, campaigns), use_container_width=True)
+    st.caption("2024-07월분은 캠페인 데이터(실집행)를 이어붙인 값입니다.")
+
+    st.info("💡 **시사점**: 비효율(고비용) 채널 예산을 고효율(저비용) 채널로 재배분할 여지가 있습니다. "
+            "단 표본이 작아 추세 모니터링을 병행하세요.")
+
+
+def main():
+    st.set_page_config(page_title="마케팅 채널 효율성 분석", layout="wide")
+    st.title("마케팅 채널 효율성 분석")
+
+    tab_marketing, tab_dashboard, tab_report = st.tabs(
+        ["마케팅 채널 효율", "고객 이탈 분석", "이탈 개선 리포트"]
+    )
+
+    with tab_marketing:
+        render_marketing_tab()
 
     with tab_dashboard:
         render_dashboard_tab()
