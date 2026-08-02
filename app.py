@@ -1011,9 +1011,41 @@ def build_diminishing_chart(spend):
     return fig
 
 
+def render_workflow_flow():
+    """상단 워크플로우 프로세스 구조도 — 이 분석을 만든 절차 흐름."""
+    steps = [
+        ("Define", "질문 정의"),
+        ("Acquire", "데이터 확보"),
+        ("Profile·Confirm", "진단·의미확인"),
+        ("Clean", "정제"),
+        ("Model", "결합·대조검증"),
+        ("Analyze", "지표 계산"),
+        ("Publish", "대시보드"),
+    ]
+    boxes = []
+    for i, (stage, desc) in enumerate(steps):
+        boxes.append(
+            '<div style="flex:1 1 108px;min-width:108px;background:#f5f8fc;border:1px solid #dbe5f1;'
+            'border-top:3px solid #4C78A8;border-radius:8px;padding:9px 10px;text-align:center;">'
+            f'<div style="font-size:10px;color:#8a94a6;font-weight:700;">STEP {i + 1}</div>'
+            f'<div style="font-size:12px;color:#2E5A88;font-weight:700;margin-top:2px;">{stage}</div>'
+            f'<div style="font-size:11px;color:#555;margin-top:2px;">{desc}</div>'
+            "</div>"
+        )
+    arrow = '<div style="display:flex;align-items:center;color:#b0b6c0;font-size:15px;">→</div>'
+    st.markdown("**🧭 분석 워크플로우** — 이 대시보드를 만든 절차")
+    st.markdown(
+        '<div style="display:flex;flex-wrap:wrap;align-items:stretch;gap:5px;margin:4px 0 14px;">'
+        + arrow.join(boxes)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_marketing_tab():
     """채널 효율 탭 — 유입 1건당 비용·집행률·지출 추세."""
     st.markdown("##### 🔹 소주제: 마케팅 채널 효율성 — 채널별 유입 1건당 비용 · 예산 집행률")
+    render_workflow_flow()
     spend, campaigns = load_marketing()
     if not spend or not campaigns:
         st.warning(
